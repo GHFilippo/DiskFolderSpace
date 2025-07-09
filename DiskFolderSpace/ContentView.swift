@@ -17,19 +17,23 @@ struct FolderInfo: Identifiable {
 class FolderAnalyzer: ObservableObject {
     @Published var folders: [FolderInfo] = []
     @Published var isLoading = false
+    @Published var failedFolders: [URL] = [] // Nuova variabile per cartelle non analizzate
     private var shouldCancel = false
+    private var failedSet = Set<URL>() // Per evitare duplicati
     
     func analyze(url: URL) {
         isLoading = true
         shouldCancel = false
         DispatchQueue.global(qos: .userInitiated).async {
             var folders: [FolderInfo] = []
+            self.failedSet = []
             if url.startAccessingSecurityScopedResource() {
                 folders = self.getFolderSizes(at: url)
                 url.stopAccessingSecurityScopedResource()
             }
             DispatchQueue.main.async {
                 self.folders = folders.sorted { $0.size > $1.size }
+                self.failedFolders = Array(self.failedSet)
                 self.isLoading = false
             }
         }
@@ -41,7 +45,10 @@ class FolderAnalyzer: ObservableObject {
     
     private func getFolderSizes(at url: URL) -> [FolderInfo] {
         let fileManager = FileManager.default
-        guard let contents = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
+        // RIMUOVO .skipsHiddenFiles per includere file e cartelle nascosti
+        guard let contents = try? fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: []) else {
+            // Se non riesce ad accedere alla cartella principale, segnala come fallita
+            self.failedSet.insert(url)
             return []
         }
         var result: [FolderInfo] = []
@@ -49,17 +56,35 @@ class FolderAnalyzer: ObservableObject {
             if shouldCancel { break }
             var isDir: ObjCBool = false
             if fileManager.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
-                let size = self.folderSize(url: item)
-                result.append(FolderInfo(url: item, size: size))
+                // Prova ad aprire la cartella, se fallisce aggiungi a failed
+                do {
+                    _ = try fileManager.contentsOfDirectory(at: item, includingPropertiesForKeys: nil, options: [])
+                } catch {
+                    self.failedSet.insert(item)
+                    continue
+                }
+                let size = self.folderSize(url: item, parent: item)
+                if size == UInt64.max {
+                    self.failedSet.insert(item)
+                } else {
+                    result.append(FolderInfo(url: item, size: size))
+                }
             }
         }
         return result
     }
     
-    private func folderSize(url: URL) -> UInt64 {
+    private func folderSize(url: URL, parent: URL) -> UInt64 {
         let fileManager = FileManager.default
-        guard let enumerator = fileManager.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey], options: [], errorHandler: nil) else {
-            return 0
+        var failed = false
+        guard let enumerator = fileManager.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey], options: [], errorHandler: { (url, error) -> Bool in
+            // Se c'è un errore di permessi, segnala fallimento
+            failed = true
+            self.failedSet.insert(parent)
+            return false
+        }) else {
+            self.failedSet.insert(parent)
+            return UInt64.max // Segnala fallimento
         }
         var total: UInt64 = 0
         for case let fileURL as URL in enumerator {
@@ -67,6 +92,9 @@ class FolderAnalyzer: ObservableObject {
             if let fileSize = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
                 total += UInt64(fileSize)
             }
+        }
+        if failed {
+            return UInt64.max
         }
         return total
     }
@@ -144,6 +172,16 @@ struct ContentView: View {
                     }
                 }
                 .frame(height: 250)
+                // Nuova tabella per cartelle non analizzate
+                if !analyzer.failedFolders.isEmpty {
+                    Text("Cartelle non analizzate per mancanza di permessi o errori:")
+                        .font(.subheadline)
+                        .padding(.top)
+                    List(analyzer.failedFolders, id: \.self) { url in
+                        Text(url.lastPathComponent)
+                    }
+                    .frame(height: 120)
+                }
             } else {
                 Text("Nessuna cartella analizzata.")
             }
